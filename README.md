@@ -327,6 +327,18 @@ Mount `/sys` too (needed later for nginx and general sanity):
 mount -t sysfs sysfs /sys
 ```
 
+> **Which shell, and whose `/sys`?** Still Shell A — but note this line runs
+> *inside* the shell the `chroot` command above just dropped you into, not
+> your original login shell (that `unshare ... chroot ... /bin/sh` call
+> replaced your shell with a new one). The `/sys` here is the **container's**
+> `/sys`, not the host's: because of `chroot`, this process's root is
+> permanently repointed at `/containerdemo/merged`, so the kernel resolves
+> the path `/sys` here as `/containerdemo/merged/sys` on the real host disk
+> — but the process itself has no way to know that; it just sees `/sys`.
+> And because `--mount` gave this process a *private* copy of the mount
+> table before the `chroot`, this mount is only visible inside this
+> namespace — the VM's real `/sys` (as seen from Shell B) is untouched.
+
 Leave this shell open and idle here — this is your container's live shell.
 
 **Why this step exists:** this is the single most important step in the
