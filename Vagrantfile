@@ -14,7 +14,7 @@ Vagrant.configure("2") do |config|
   end
 
   # Only base OS tooling. Everything container-related (overlayfs, namespaces,
-  # cgroups, veth, nginx-in-Alpine) is done by hand, following GUIDE.md.
+  # cgroups, veth, nginx-in-Alpine) is done by hand, following README.md.
   config.vm.provision "shell", inline: <<-SHELL
     set -euo pipefail
     apt-get update -y
