@@ -183,7 +183,9 @@ writing files to a directory like any other extraction.
 
 ## 3. Mount the overlay
 
-**Shell A.**
+**Shell A** — the same root shell you used for steps 1–2 (the one that's
+still `cd`'d into `/containerdemo` from step 1, though it doesn't actually
+matter here — see the note below).
 
 ```bash
 mount -t overlay overlay \
@@ -192,6 +194,19 @@ mount -t overlay overlay \
 
 ls /containerdemo/merged
 ```
+
+> **Which directory do you need to be in?** None in particular — every path
+> in this command (`lowerdir=`, `upperdir=`, `workdir=`, and the mountpoint
+> argument) is written as an absolute path starting with `/containerdemo/...`,
+> so it resolves identically no matter what your shell's current working
+> directory is. This is deliberate: `mount(8)` and the overlay driver
+> resolve these paths via `kern_path()` at mount time regardless of any
+> notion of "current directory" — only the shell process invoking `mount`
+> has a cwd, and it's irrelevant to how the kernel interprets the option
+> string. You could run this exact command from `/`, `/root`, or anywhere
+> else and get the same result. It must, however, run as **root** (or with
+> `CAP_SYS_ADMIN`), since mounting any filesystem is a privileged operation
+> — which is why this whole session is under `sudo -i`.
 
 `merged` now shows Alpine's filesystem. Any file the container writes lands
 in `upper` — `lower` stays untouched, which is what lets you diff the
