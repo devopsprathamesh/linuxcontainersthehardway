@@ -687,13 +687,22 @@ curl -i 127.0.0.1
 > returned a deliberate answer — real application behavior, not just a
 > file read.
 
+> **If you run `nginx` a second time** (e.g. re-running this block after
+> already completing it once), it will fail with
+> `bind() to 0.0.0.0:80 failed (98: Address in use)` — this is expected,
+> not an error to fix. It means the *first* nginx master process is still
+> running and still holding port 80 in this namespace; the second `nginx`
+> invocation simply can't take a port that's already bound. `curl` will
+> keep working fine against the original instance. Check with `ps aux |
+> grep nginx`, or `pkill nginx` first if you actually want a clean restart.
+
 **Command-by-command:**
 
 | Command | Where it runs | Before | What it does | After / how to check |
 |---|---|---|---|---|
 | `apk update` | Shell A | No local package index cached inside the container | Uses the container's own DNS + routing (both just built in step 7) to fetch Alpine's repo index over HTTP(S), through the veth+NAT path, into local cache | `apk` now knows what package versions are available |
 | `apk add nginx curl` | Shell A | `nginx` binary/config absent from the rootfs; `curl` isn't in the Alpine minirootfs either — only BusyBox's built-in applets (`wget`, etc.) ship by default, unlike the VM host, which has real `curl` | Downloads both `.apk` packages and extracts their files into the container's filesystem — every write goes through the overlay, landing in `upper/` via copy-up — then runs any post-install scripts each package ships | `/usr/sbin/nginx`, `/etc/nginx/`, `/usr/bin/curl`, etc. now exist, and are visible in `upper/` (see step 10) |
-| `nginx` | Shell A | Nothing bound to port 80 in this network namespace | Starts the nginx master process, which forks worker processes (they automatically inherit this container's PID/mount/net namespaces — no need to `unshare` again), and binds a listening socket on `0.0.0.0:80` scoped to this namespace's own socket table | `ps aux` shows nginx's master + worker processes; a listening socket exists on `:80` |
+| `nginx` | Shell A | Nothing bound to port 80 in this network namespace *(first run only — see note below)* | Starts the nginx master process, which forks worker processes (they automatically inherit this container's PID/mount/net namespaces — no need to `unshare` again), and binds a listening socket on `0.0.0.0:80` scoped to this namespace's own socket table | `ps aux` shows nginx's master + worker processes; a listening socket exists on `:80` |
 | `curl -i 127.0.0.1` | Shell A | — | Connects via the container's *own* private loopback (from step 7, separate from the host's `lo`), delivered straight to nginx's listening socket; nginx's default server block matches the request and executes its configured `return 404` | Prints `HTTP/1.1 404 Not Found` plus an HTML body with `nginx` in the footer — this is a real response *from* nginx, not a connection failure |
 
 **Why this step exists:** everything so far has been infrastructure — a
