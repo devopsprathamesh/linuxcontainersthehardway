@@ -930,7 +930,7 @@ cat /proc/mounts | grep -E 'proc|sysfs|overlay'
 | `ip route show` | Route to `10.200.1.0/24` via `veth-host`; VM's own default route via `enp0s3` | Route to `10.200.1.0/24` via `veth-ctr`; default route via `10.200.1.1` | Two independent routing tables, only connected by the veth link |
 | `iptables ... -L -n -v` | Shows the `MASQUERADE`/`FORWARD` rules from step 7, with non-zero packet/byte counters if you've generated traffic | N/A — the container's own netfilter tables are separate and, in this lab, untouched (empty) | The NAT/forwarding rules live entirely in the host's namespace; the container has no idea they exist |
 | `cat /etc/resolv.conf` | The VM's own real `resolv.conf` (from Ubuntu/DHCP) | `nameserver 8.8.8.8` — the line you wrote by hand in step 7 | Different files entirely, because `--mount` (step 5) gave the container its own private filesystem view via the overlay |
-| `mount`/`/proc/mounts` for `overlay` | Shows the overlay mounted at `/containerdemo/merged` | Doesn't show an `overlay` entry for `/` at all — `chroot` doesn't produce a mount entry, it just changes what `/` resolves to for path lookups | A reminder from step 5's explanation: `chroot` is a path-resolution trick, not a mount — the overlay mount itself is only visible from the namespace that actually performed the `mount(2)` call (both here, since `--mount`'s namespace copy happened *after* step 3's mount) |
+| `mount`/`/proc/mounts` for `overlay` | Shows the overlay mounted at `/containerdemo/merged` | Shows the *same* overlay mount, but reported as `/` | `/proc/[pid]/mounts` always reports mount paths **relative to the reading process's own root** — and `chroot` is exactly what changed that for Shell A. Same underlying mount, same superblock, just displayed relative to two different roots depending on who's asking. (You may also see `/proc` listed twice from inside the container if you ever ran `mount -t proc proc /proc` more than once — Linux allows stacking mounts at the same mountpoint rather than replacing them; harmless, `umount /proc` once removes the top one.) |
 | `du -sh upper/` vs `lower/` | `upper/` is a few MB (nginx + curl + their deps); `lower/` is the untouched ~3MB Alpine base | — | Concrete disk-usage evidence of copy-up (step 3) and everything step 10's diff already itemized by name |
 | `ps aux \| grep -E 'nginx\|chroot'` — the `USER` column for nginx's workers | Shows `systemd+` (truncated `systemd-network`) as the owner | Shows `nginx` as the owner, for the *same two processes* | See the callout below — this is the one namespace type this lab deliberately never isolates |
 
@@ -1030,3 +1030,12 @@ created — but it's also worth knowing this is exactly how tools like `ip
 netns add` deliberately *keep* a namespace alive with no process running in
 it at all: by bind-mounting its `nsfs` inode to a persistent path under
 `/var/run/netns/`, holding the reference count above zero indefinitely.
+
+---
+
+Copyright 2026 devoopsprathamesh
+
+Licensed under the Apache License, Version 2.0 (the "License"); see
+[LICENSE](LICENSE) for the full text. You may not use this project except
+in compliance with the License, which is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
