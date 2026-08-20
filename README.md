@@ -932,6 +932,46 @@ cat /proc/mounts | grep -E 'proc|sysfs|overlay'
 | `cat /etc/resolv.conf` | The VM's own real `resolv.conf` (from Ubuntu/DHCP) | `nameserver 8.8.8.8` — the line you wrote by hand in step 7 | Different files entirely, because `--mount` (step 5) gave the container its own private filesystem view via the overlay |
 | `mount`/`/proc/mounts` for `overlay` | Shows the overlay mounted at `/containerdemo/merged` | Doesn't show an `overlay` entry for `/` at all — `chroot` doesn't produce a mount entry, it just changes what `/` resolves to for path lookups | A reminder from step 5's explanation: `chroot` is a path-resolution trick, not a mount — the overlay mount itself is only visible from the namespace that actually performed the `mount(2)` call (both here, since `--mount`'s namespace copy happened *after* step 3's mount) |
 | `du -sh upper/` vs `lower/` | `upper/` is a few MB (nginx + curl + their deps); `lower/` is the untouched ~3MB Alpine base | — | Concrete disk-usage evidence of copy-up (step 3) and everything step 10's diff already itemized by name |
+| `ps aux \| grep -E 'nginx\|chroot'` — the `USER` column for nginx's workers | Shows `systemd+` (truncated `systemd-network`) as the owner | Shows `nginx` as the owner, for the *same two processes* | See the callout below — this is the one namespace type this lab deliberately never isolates |
+
+> **The nginx worker "username" mismatch — the gap this lab leaves open.**
+> If you run `ps aux` in **Shell B** and look at nginx's worker processes,
+> you'll likely see them owned by `systemd-network` (truncated to
+> `systemd+` in the column), not `nginx` — even though the exact same
+> processes, viewed from **Shell A** with its own `ps aux`, correctly show
+> `nginx` as the owner. Both are "right," and the reason why is the whole
+> point of this callout:
+>
+> - Alpine's `nginx` package creates a system user literally called `nginx`
+>   — on this rootfs, that account landed at UID `100`.
+> - Ubuntu 22.04 happens to *already* have a system account at UID `100`:
+>   `systemd-network`.
+> - `unshare` back in step 5 never included `--user` (`CLONE_NEWUSER`) —
+>   this lab, like the video it's based on, intentionally skips **user
+>   namespaces**. That means UIDs are **not** namespaced here: a UID is
+>   just one shared, global number in the kernel, identical whether the
+>   host or the container is asking.
+> - A UID number is not a username — turning `100` into text is a lookup
+>   (`getpwuid()`) against `/etc/passwd`, done using *whichever*
+>   `/etc/passwd` the process performing the lookup can see. Shell B (an
+>   unnamespaced host process) reads the VM's own `/etc/passwd`, where
+>   `100` means `systemd-network`. Shell A reads Alpine's `/etc/passwd`
+>   (through the overlay), where `100` means `nginx`. Same raw UID, two
+>   different label lookups, zero actual security boundary between them.
+>
+> This is exactly the class of accident production systems worry about: if
+> this were a real multi-tenant host, a container choosing UID `100` for
+> its own purposes could collide with a *meaningful* system account on the
+> host, and — because UIDs aren't namespaced — a process "running as
+> `nginx`" inside the container is, as far as the kernel's permission
+> checks are concerned, genuinely indistinguishable from a process running
+> as `systemd-network` on the host. Real container runtimes address this
+> with **user namespaces** (`--user`/`CLONE_NEWUSER`), which let a
+> container's UID `0` (or any UID) map to an *unprivileged*, container-only
+> UID range on the host, so a collision like this one has no real-world
+> consequence. This lab skips it purely for simplicity — it's the one
+> pillar of the "four kernel mechanisms" list from the very top of this
+> guide that doesn't get its own dedicated step here.
 
 ## 12. Teardown
 
