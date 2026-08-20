@@ -744,6 +744,38 @@ namespaces, veth, routing, NAT/forwarding rules — is working end to end.
 (A matching `404` is the success condition here, not a failure — see the
 callout in step 8 for why Alpine's `nginx` responds this way by default.)
 
+### Optional: see an actual "It works" page instead of the 404
+
+The `404` above is already full proof the stack works — this part is purely
+cosmetic, for anyone who'd rather see familiar HTML than a 404 body. Run
+this in **Shell A** (inside the container), then re-run the `curl` from
+**Shell B**:
+
+```bash
+cat > /etc/nginx/http.d/default.conf << 'EOF'
+server {
+    listen 80 default_server;
+    root /var/lib/nginx/html;
+    index index.html;
+}
+EOF
+nginx -s reload
+```
+
+Then, back in **Shell B**:
+
+```bash
+curl -i 10.200.1.2
+```
+
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does | After / how to check |
+|---|---|---|---|---|
+| `cat > /etc/nginx/http.d/default.conf << 'EOF' ... EOF` | Shell A | The file contains Alpine's shipped default vhost (`location / { return 404; }`) | Overwrites the file with a new server block that sets `root /var/lib/nginx/html` and serves `index.html` from it instead of unconditionally returning 404. This write goes through the overlay: since the file already exists in `lower/` (it shipped with the `nginx` package installed in step 8, so it's actually already in `upper/` from that copy-up), this just updates the copy already sitting in `upper/`. | `cat /etc/nginx/http.d/default.conf` shows the new config |
+| `nginx -s reload` | Shell A | The running master process (from step 8) still holds the old, in-memory config | Sends `SIGHUP` to the master process via its PID file. On `SIGHUP`, nginx re-reads its config files from disk and starts new worker processes with the updated config, gracefully phasing out the old workers — no downtime, no need to `nginx -s stop`/start again | New workers appear in `ps aux` with a fresh start time |
+| `curl -i 10.200.1.2` (from Shell B) | Shell B | — | Same veth path as before, but now nginx's `location /` matches the `root`/`index` directives instead of the `return 404` | `HTTP/1.1 200 OK` with the actual `index.html` content from `/var/lib/nginx/html/index.html` |
+
 **Why this step exists:** step 8 proved the container can reach *out*. This
 step proves the reverse direction — that something *outside* the container
 can reach *in* — closing the loop and confirming the whole network path is
