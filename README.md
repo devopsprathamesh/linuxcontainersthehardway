@@ -304,20 +304,44 @@ yet — that's fixed in step 6.
 **Shell A.**
 
 `unshare` detaches the new process from the host's PID/UTS/IPC/mount/network
-namespaces before `chroot`-ing it into the overlay. `--mount-proc` gives it
-its own `/proc` reflecting only its own (empty, so far) process tree.
+namespaces, then `chroot`s it into the overlay.
 
 ```bash
-unshare --pid --uts --ipc --mount --net --fork --mount-proc \
+unshare --pid --uts --ipc --mount --net --fork \
   chroot /containerdemo/merged /bin/sh
 ```
 
-You're now inside the container. Confirm the isolation:
+You're now inside the container. Before anything else, mount a fresh
+`/proc` — the one that's there right now is just an empty directory from
+the Alpine tarball, not a live view into the kernel's process table:
+
+```bash
+mount -t proc proc /proc
+```
+
+> **Why this is needed even though `unshare` has a `--mount-proc` flag:**
+> that flag mounts `/proc` *just before* `unshare` execs the next program —
+> but the next program here is `chroot ... /bin/sh`, and the mount happens
+> **before** `chroot` runs. So `--mount-proc` would mount procfs onto the
+> host's real `/proc` path (isolated inside the new mount namespace, but
+> still pre-chroot), and then `chroot` immediately hides it behind the new
+> root. From that point on, `/proc` means `/containerdemo/merged/proc` — an
+> empty directory with nothing mounted there at all. If you skip this step,
+> `ps aux` will print only the header row (no processes, not even itself)
+> and `top` will fail with `no process info in /proc` — there's simply no
+> procfs mounted at the path either tool is reading from. Mounting it
+> manually, from inside the chroot, is the only way to get a procfs that's
+> both visible at the container's `/proc` *and* correctly scoped to the new
+> PID namespace (which it is, because by this point the running shell is
+> already inside that namespace — a `mount -t proc` always reflects the PID
+> namespace of whichever process performs the mount).
+
+Now confirm the isolation:
 
 ```bash
 hostname containerdemo
 hostname
-ps aux                 # should show almost nothing — this is PID 1's own tree
+ps aux                 # should show exactly one process — this shell, as PID 1
 ip link                # only shows nothing or a down 'lo' — no host interfaces visible
 ```
 
@@ -358,8 +382,8 @@ other than the outside world.
 below swaps one of those references for a brand-new, empty/private one:
 
 - **`--pid` (`CLONE_NEWPID`)** — a new PID namespace. The shell that runs
-  becomes **PID 1** *inside* that namespace — that's why `ps aux` shows
-  almost nothing, it's a fresh process table with only itself in it — but
+  becomes **PID 1** *inside* that namespace — that's why, once `/proc` is
+  properly mounted below, `ps aux` shows exactly one process (itself) — but
   the exact same process still holds an ordinary, real PID as seen from the
   VM's host namespace (visible via `/proc/<pid>/status`'s `NSpid` line,
   which lists the PID as seen from every ancestor namespace at once). PID
@@ -396,12 +420,11 @@ below swaps one of those references for a brand-new, empty/private one:
 - **`--fork`** — `unshare` itself has to `fork()` a child to actually enter
   the new PID namespace cleanly (a process can't become PID-1-of-a-new-
   namespace without being created *after* the namespace exists).
-- **`--mount-proc`** — remounts `/proc` inside the new mount+PID namespace
-  so it reflects *this* process tree. This matters because `/proc` isn't a
-  static file tree — it's a live, kernel-generated view filtered by which
-  PID namespace is doing the reading. Skipping this flag would leave the
-  container looking at the host's `/proc`, and tools like `ps` would show
-  the host's entire process list instead of the container's own.
+
+Note there's no `--mount-proc` flag on this command, even though `unshare`
+offers one — see the callout right after the command block below for why
+it doesn't help in a chroot-based setup like this one, and why `/proc` gets
+mounted by hand instead, after the `chroot`.
 
 **Then `chroot /containerdemo/merged /bin/sh`** changes which directory the
 kernel treats as `/` for this process's path lookups (technically, it
