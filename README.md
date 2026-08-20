@@ -25,7 +25,7 @@ machine is at risk; `vagrant destroy` gets you a clean kernel again in
 seconds). Each step below explains **why that step exists** in the bigger
 picture, then walks every command in a **before → what happened → after**
 table, so you can see exactly what changed on the system at each line —
-the goal is that by step 11 you could explain to someone else, from memory,
+the goal is that by the end you could explain to someone else, from memory,
 what `docker run` is actually doing under the hood.
 
 ## Prerequisites
@@ -832,7 +832,73 @@ immutable image layer, which becomes tomorrow's `lower/` for someone else's
 container. You are looking, by hand, at precisely the artifact a real
 container build pipeline would package and push to a registry.
 
-## 11. Teardown
+## 11. Inspect everything you built (full state audit)
+
+**Both shells.** Before tearing anything down, this is a checkpoint — every
+kernel object this lab created, in one place, so you can see the complete
+picture (and so you have something to compare against *after* step 12's
+cleanup, to confirm it actually all went away).
+
+**Shell B (host side) — everything visible from outside the container:**
+
+```bash
+# Namespaces: prove the container's process really is in different
+# namespaces than this shell, by comparing inode numbers
+CPID=<PID>          # from step 6/7, if you don't still have it
+readlink /proc/self/ns/{pid,uts,ipc,mnt,net}
+readlink /proc/$CPID/ns/{pid,uts,ipc,mnt,net}
+
+# cgroup
+cat /sys/fs/cgroup/containerdemo/memory.max
+cat /sys/fs/cgroup/containerdemo/cgroup.procs
+
+# Networking
+ip link show
+ip addr show veth-host
+ip route show
+iptables -t nat -L POSTROUTING -n -v
+iptables -L FORWARD -n -v
+
+# The overlay mount (visible here too — it was mounted in step 3,
+# before step 5 split off a private mount namespace)
+findmnt /containerdemo/merged
+mount | grep overlay
+
+# Directories on disk
+du -sh /containerdemo/{lower,upper,work,merged}
+
+# Processes — the host can see the container's processes too
+# (PID namespaces nest), just under their real, host-assigned PIDs
+ps aux | grep -E 'nginx|chroot'
+```
+
+**Shell A (inside the container) — the same system, from the container's
+own private point of view:**
+
+```bash
+hostname
+ps aux
+ip link
+ip addr
+ip route
+cat /etc/resolv.conf
+cat /proc/mounts | grep -E 'proc|sysfs|overlay'
+```
+
+**What you should see, and why it's proof the isolation is real:**
+
+| Check | Shell B (host) shows | Shell A (container) shows | Why they differ |
+|---|---|---|---|
+| Namespace inodes (`readlink /proc/.../ns/*`) | `pid:[4026531836]`-style values for the *host's* namespaces | Different numbers for `$CPID`'s namespaces when read from Shell B, and different again from *inside* via `/proc/self/ns/*` in Shell A | Different inode numbers on the `nsfs` pseudo-filesystem prove these are genuinely separate kernel namespace objects, not just cosmetic — this is the most direct evidence namespaces exist at all |
+| `cgroup.procs` | Lists the container shell's real PID (and nginx's, once forked) | N/A — cgroup membership isn't something a process can query about itself this way | Confirms step 6's cgroup attachment is still active |
+| `ip link show` | `lo`, `enp0s3`, `enp0s8`, `veth-host` — **no `veth-ctr`** | `lo`, `veth-ctr` — **no `veth-host`, no `enp0s3`/`enp0s8`** | Two completely disjoint interface lists — proof the net namespace split in step 7 is real, not shared |
+| `ip route show` | Route to `10.200.1.0/24` via `veth-host`; VM's own default route via `enp0s3` | Route to `10.200.1.0/24` via `veth-ctr`; default route via `10.200.1.1` | Two independent routing tables, only connected by the veth link |
+| `iptables ... -L -n -v` | Shows the `MASQUERADE`/`FORWARD` rules from step 7, with non-zero packet/byte counters if you've generated traffic | N/A — the container's own netfilter tables are separate and, in this lab, untouched (empty) | The NAT/forwarding rules live entirely in the host's namespace; the container has no idea they exist |
+| `cat /etc/resolv.conf` | The VM's own real `resolv.conf` (from Ubuntu/DHCP) | `nameserver 8.8.8.8` — the line you wrote by hand in step 7 | Different files entirely, because `--mount` (step 5) gave the container its own private filesystem view via the overlay |
+| `mount`/`/proc/mounts` for `overlay` | Shows the overlay mounted at `/containerdemo/merged` | Doesn't show an `overlay` entry for `/` at all — `chroot` doesn't produce a mount entry, it just changes what `/` resolves to for path lookups | A reminder from step 5's explanation: `chroot` is a path-resolution trick, not a mount — the overlay mount itself is only visible from the namespace that actually performed the `mount(2)` call (both here, since `--mount`'s namespace copy happened *after* step 3's mount) |
+| `du -sh upper/` vs `lower/` | `upper/` is a few MB (nginx + curl + their deps); `lower/` is the untouched ~3MB Alpine base | — | Concrete disk-usage evidence of copy-up (step 3) and everything step 10's diff already itemized by name |
+
+## 12. Teardown
 
 **Shell A** — exit the container:
 
