@@ -23,7 +23,8 @@ disposable Vagrant VM (so if you break namespaces, cgroups, or iptables
 rules on the "host" — which here is just the VM — nothing on your real
 machine is at risk; `vagrant destroy` gets you a clean kernel again in
 seconds). Each step below explains **why that step exists** in the bigger
-picture, then **exactly what the kernel does** when you run the commands —
+picture, then walks every command in a **before → what happened → after**
+table, so you can see exactly what changed on the system at each line —
 the goal is that by step 11 you could explain to someone else, from memory,
 what `docker run` is actually doing under the hood.
 
@@ -73,6 +74,11 @@ cgroups/networking from the outside. Open a second terminal now and run
 need it. Call this **Shell A** (will enter the container) and **Shell B**
 (stays on the host).
 
+Until step 5, Shell A and Shell B are functionally identical — both are
+plain root shells sitting in the VM's default (un-namespaced) PID, mount,
+and network context. They only start to diverge once step 5's `unshare`
+puts Shell A into a separate world.
+
 ---
 
 ## 1. Workspace layout
@@ -90,6 +96,13 @@ OverlayFS needs three directories plus a mountpoint:
 mkdir -p /containerdemo/{lower,upper,work,merged}
 cd /containerdemo
 ```
+
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `mkdir -p /containerdemo/{lower,upper,work,merged}` | Shell A, VM's normal (default) filesystem — no namespaces active yet | `/containerdemo` doesn't exist at all | The shell expands the `{...}` brace list *itself* before running anything, turning this into one `mkdir` call with five paths; the kernel's `mkdir(2)` syscall creates the parent directory and all four children on the VM's real root filesystem (ext4, from the `ubuntu/jammy64` box) | `ls -la /containerdemo` shows `lower/ upper/ work/ merged/`, all empty, all real directories on disk |
+| `cd /containerdemo` | Shell A | Shell's current working directory was wherever `sudo -i` started (typically `/root`) | A shell builtin, not even a syscall you'd strace as a separate program — calls `chdir(2)` to update *this shell process's* notion of cwd only; no kernel object is created and nothing else on the system is affected | `pwd` now prints `/containerdemo` |
 
 **Why this step exists:** before we can talk about namespaces, cgroups, or
 networking, the container needs *somewhere to live* — a root filesystem.
@@ -163,6 +176,14 @@ ls lower
 > `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/` and swap in
 > the current filename.
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does | After / how to check |
+|---|---|---|---|---|
+| `curl -L -o alpine-minirootfs.tar.gz https://...` | Shell A, VM's normal (still un-namespaced) network stack | No such file in the current directory | Opens an outbound TCP/TLS connection over the VM's *real* NAT interface (`enp0s3`) — this is well before step 5/7's namespace/veth setup, so it's ordinary VM-to-internet traffic — follows any redirects (`-L`), and streams the HTTP response body to disk | `ls -la alpine-minirootfs.tar.gz` shows a ~3MB file |
+| `tar -xzf alpine-minirootfs.tar.gz -C lower` | Shell A | `lower/` exists but is empty (created in step 1) | Decompresses the gzip stream, then extracts every entry from the tar archive into `lower/`, recreating each file's permissions, ownership, and symlinks exactly as recorded in the archive | `lower/` now contains a full Alpine root tree: `bin/`, `etc/`, `usr/`, `var/`, ... |
+| `ls lower` | Shell A | — | Plain directory listing, purely read-only, no kernel state touched | Prints the extracted top-level entries |
+
 **Why this step exists:** `lower/` was created empty in step 1 — it needs
 actual content before an overlay mount over it means anything. We picked
 Alpine specifically because it's tiny (built on `musl` libc and BusyBox
@@ -207,6 +228,13 @@ ls /containerdemo/merged
 > else and get the same result. It must, however, run as **root** (or with
 > `CAP_SYS_ADMIN`), since mounting any filesystem is a privileged operation
 > — which is why this whole session is under `sudo -i`.
+
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `mount -t overlay overlay -o lowerdir=...,upperdir=...,workdir=... /containerdemo/merged` | Shell A, VM's default mount namespace (still un-namespaced — step 5 is what gives the container its own) | `merged/` is an empty directory; no overlay superblock exists anywhere on the system | Kernel resolves `lower/`, `upper/`, `work/`, and the mountpoint via `kern_path()`; validates `upper/`+`work/` share a filesystem; builds an in-kernel `ovl_fs` struct holding references to all three; constructs a union root inode; attaches a brand-new superblock as a `vfsmount` at `/containerdemo/merged` | `mount \| grep overlay` shows the new mount entry; `ls /containerdemo/merged` now shows Alpine's full tree even though nothing was physically copied |
+| `ls /containerdemo/merged` | Shell A | — | Every lookup here is now intercepted by `ovl_lookup()`: checks `upper/` first (still empty), falls through to `lower/` for each entry | Prints Alpine's rootfs contents (`bin`, `etc`, `usr`, ...) |
 
 `merged` now shows Alpine's filesystem. Any file the container writes lands
 in `upper` — `lower` stays untouched, which is what lets you diff the
@@ -267,6 +295,14 @@ echo 268435456 > /sys/fs/cgroup/containerdemo/memory.max   # 256MB cap
 cat /sys/fs/cgroup/containerdemo/memory.max
 ```
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `mkdir /sys/fs/cgroup/containerdemo` | Shell B | No `containerdemo` cgroup exists — only the root cgroup and whatever systemd/Ubuntu already created | `mkdir(2)` on `cgroupfs` isn't a normal directory create — it's intercepted by the kernel's cgroup core, which allocates a real `cgroup` kernel object and auto-populates it with a full set of control files (`memory.max`, `memory.current`, `cgroup.procs`, `cgroup.controllers`, ...) | `ls /sys/fs/cgroup/containerdemo` shows those auto-created control files, none of which you wrote yourself |
+| `echo 268435456 > /sys/fs/cgroup/containerdemo/memory.max` | Shell B | `memory.max` defaults to the string `max` (unlimited) | The `write()` syscall on this virtual file is intercepted by the kernel's memory controller, which parses the number and stores it as this cgroup's new page-charge ceiling | `cat memory.max` reads back `268435456` instead of `max` |
+| `cat /sys/fs/cgroup/containerdemo/memory.max` | Shell B | — | Read-only confirmation, no state change | Prints `268435456` |
+
 The cgroup exists but has no processes yet — you'll add the container's PID
 in step 6, once it exists.
 
@@ -282,22 +318,18 @@ shared Kubernetes node can starve every other pod if nobody set
 **Under the hood:** `/sys/fs/cgroup` isn't a normal directory tree — it's
 `cgroupfs`, a pseudo-filesystem the kernel exposes specifically so cgroup
 management can be done with plain `mkdir`/`echo`/`cat` instead of dedicated
-syscalls. Creating a directory here is intercepted by the cgroupfs driver
-and creates a real kernel `cgroup` object, complete with its own set of
-control files (`memory.max`, `memory.current`, `cgroup.procs`, `pids.max`,
-and more, listed in `cgroup.controllers`). Writing to `memory.max` is read
-by the kernel's memory controller, which maintains a live page counter for
-every process charged to this cgroup; the moment total charged memory would
-exceed that limit, the kernel's OOM killer is invoked *scoped to this
-cgroup* — it kills a process inside `containerdemo` to bring usage back
-under the cap, without touching anything else running on the VM. This
-machine uses cgroup v2's *unified* hierarchy — one single tree covering all
-resource controllers (memory, cpu, pids, io, ...) — which replaced the
-older v1 model where every controller had its own separate, independently
-mountable hierarchy and processes could end up in inconsistent positions
-across them. The cgroup is deliberately created empty: `cgroup.procs`
-starts with zero entries because the process it will govern doesn't exist
-yet — that's fixed in step 6.
+syscalls. Writing to `memory.max` is read by the kernel's memory controller,
+which maintains a live page counter for every process charged to this
+cgroup; the moment total charged memory would exceed that limit, the
+kernel's OOM killer is invoked *scoped to this cgroup* — it kills a process
+inside `containerdemo` to bring usage back under the cap, without touching
+anything else running on the VM. This machine uses cgroup v2's *unified*
+hierarchy — one single tree covering all resource controllers (memory, cpu,
+pids, io, ...) — which replaced the older v1 model where every controller
+had its own separate, independently mountable hierarchy and processes
+could end up in inconsistent positions across them. The cgroup is
+deliberately created empty: `cgroup.procs` starts with zero entries because
+the process it will govern doesn't exist yet — that's fixed in step 6.
 
 ## 5. Create namespaces + chroot
 
@@ -365,6 +397,18 @@ mount -t sysfs sysfs /sys
 
 Leave this shell open and idle here — this is your container's live shell.
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `unshare --pid --uts --ipc --mount --net --fork chroot /containerdemo/merged /bin/sh` | Shell A, still the VM's default namespaces at the moment you press enter | Shell A is an ordinary process sharing the VM's PID/UTS/IPC/mount/net namespaces; its root is `/` | `unshare(2)` forks a child (`--fork`) and detaches 5 namespace references in that child's `nsproxy` struct, replacing each with a fresh, private one; the child then calls `chroot(2)`, repointing `task_struct->fs->root` at `/containerdemo/merged`; finally it `execve()`s `/bin/sh` | You get a new shell prompt (typically `/ #`, BusyBox `ash`'s prompt). This process is PID 1 in a brand-new PID namespace, has its own hostname/IPC/mount table/network stack, and its filesystem root is `/containerdemo/merged` |
+| `mount -t proc proc /proc` | Shell A, now inside the chroot | `/proc` is an empty directory (shipped in the Alpine tarball) | Mounts a fresh procfs instance at the (chrooted) `/proc`, scoped to this process's new PID namespace since that's the namespace the mounting process is in | `ps aux` and `top` now work — they read live kernel data instead of an empty directory |
+| `hostname containerdemo` | Shell A | UTS namespace's hostname is whatever the VM's was at the moment of `unshare` | `sethostname(2)` writes to *this namespace's private copy only* | — |
+| `hostname` | Shell A | — | Read-only | Prints `containerdemo` |
+| `ps aux` | Shell A | — | Reads the freshly-mounted procfs, which is inherently filtered to processes visible in this PID namespace | Shows exactly one row: this shell, as PID 1 |
+| `ip link` | Shell A | — | Reads this process's (new, empty) network namespace's interface list | Shows only `lo`, and it's `DOWN` |
+| `mount -t sysfs sysfs /sys` | Shell A | `/sys` is an empty directory (from the tarball) | Mounts a fresh sysfs instance at the chrooted `/sys`, visible only inside this private mount namespace | `ls /sys` now shows real kernel/device entries instead of nothing |
+
 **Why this step exists:** this is the single most important step in the
 whole lab — it's the moment an ordinary shell process becomes, for all
 practical purposes, "a container." Everything before this (overlay,
@@ -372,7 +416,7 @@ cgroup) prepared the environment; this step is what actually puts a process
 *into* that environment and cuts it off from seeing the host as anything
 other than the outside world.
 
-**Under the hood — what each flag actually detaches, one at a time:**
+**Under the hood — what each namespace flag actually detaches:**
 
 `unshare` wraps the `unshare(2)` syscall (the same underlying mechanism as
 `clone(2)`'s namespace flags — this is literally how `clone()` inside
@@ -383,7 +427,7 @@ below swaps one of those references for a brand-new, empty/private one:
 
 - **`--pid` (`CLONE_NEWPID`)** — a new PID namespace. The shell that runs
   becomes **PID 1** *inside* that namespace — that's why, once `/proc` is
-  properly mounted below, `ps aux` shows exactly one process (itself) — but
+  properly mounted, `ps aux` shows exactly one process (itself) — but
   the exact same process still holds an ordinary, real PID as seen from the
   VM's host namespace (visible via `/proc/<pid>/status`'s `NSpid` line,
   which lists the PID as seen from every ancestor namespace at once). PID
@@ -396,7 +440,7 @@ below swaps one of those references for a brand-new, empty/private one:
   with it (the same "reaping" behavior real init systems inside containers
   have to handle).
 - **`--uts` (`CLONE_NEWUTS`)** — a private hostname/domainname. `hostname
-  containerdemo` below writes to this namespace's copy only; the VM's own
+  containerdemo` writes to this namespace's copy only; the VM's own
   hostname is untouched.
 - **`--ipc` (`CLONE_NEWIPC`)** — isolated System V IPC objects (shared
   memory segments, semaphores, message queues) and POSIX message queues, so
@@ -404,7 +448,7 @@ below swaps one of those references for a brand-new, empty/private one:
   anything on the host.
 - **`--mount` (`CLONE_NEWNS`)** — a private *copy* of the mount table (note:
   a copy, not empty — every mount the host currently has is initially
-  visible too). This is what lets `mount -t sysfs sysfs /sys` below, and the
+  visible too). This is what lets `mount -t sysfs sysfs /sys`, and the
   `chroot` itself, happen without touching the VM's real mount table. In
   production container runtimes, this new mount namespace is also
   explicitly marked with private propagation (`MS_PRIVATE`, recursively) so
@@ -422,9 +466,9 @@ below swaps one of those references for a brand-new, empty/private one:
   namespace without being created *after* the namespace exists).
 
 Note there's no `--mount-proc` flag on this command, even though `unshare`
-offers one — see the callout right after the command block below for why
-it doesn't help in a chroot-based setup like this one, and why `/proc` gets
-mounted by hand instead, after the `chroot`.
+offers one — see the callout above for why it doesn't help in a
+chroot-based setup like this one, and why `/proc` gets mounted by hand
+instead, after the `chroot`.
 
 **Then `chroot /containerdemo/merged /bin/sh`** changes which directory the
 kernel treats as `/` for this process's path lookups (technically, it
@@ -462,26 +506,32 @@ cat /sys/fs/cgroup/containerdemo/cgroup.procs
 
 The container process (and anything it forks) is now memory-capped.
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `ps aux \| grep "[c]hroot /containerdemo/merged"` | Shell B | — | Reads the **host's own** `/proc` (Shell B was never namespaced, so it sees the VM's real, full process table). Because PID namespaces nest, every process inside the container's PID namespace is *also* visible here — just under its real, host-assigned PID number instead of its in-container number (1) | Prints one line: the container shell's real, host-visible PID |
+| `echo <PID> > /sys/fs/cgroup/containerdemo/cgroup.procs` | Shell B | `cgroup.procs` is empty (step 4 created the cgroup with nothing in it) | The `write()` on this control file is intercepted by cgroup core: validates the PID refers to a live process, then atomically updates that task's `css_set` pointer — the internal structure tying it to cgroup membership across every controller at once | — |
+| `cat /sys/fs/cgroup/containerdemo/cgroup.procs` | Shell B | — | Read-only confirmation | Shows the PID now listed as a member |
+
 **Why this step exists:** the cgroup was created empty in step 4 because the
 process it needed to govern didn't exist yet. Now it does (step 5 created
 it), so this step is simply the missing link — connecting the resource cap
 that already exists to the process that's now running.
 
-**Under the hood:** writing a PID to `cgroup.procs` updates that task's
-`css_set` pointer inside the kernel — the internal structure that ties a
-process to its cgroup membership across every controller at once (memory,
-cpu, pids, etc. all move together). From this moment forward, every page of
-memory this process (or anything it later forks) allocates gets charged
-against `containerdemo`'s `memory.max`, and any child process automatically
-inherits its parent's cgroup membership — you don't need to repeat this
-step for processes the container spawns later (like `nginx`, in step 8).
-Worth noting for realism: this two-step "create process, then move it into
-a cgroup" approach has a small race window where the process briefly runs
-*before* being resource-constrained. Modern container runtimes like `runc`
-close that gap using the `clone3(2)` syscall's `CLONE_INTO_CGROUP` flag
-(Linux 5.7+), which places a process into a target cgroup atomically as
-part of its creation — no window at all. We're using the older, two-step
-approach here because it's easier to observe and reason about by hand.
+**Under the hood:** from the moment the PID is written into `cgroup.procs`,
+every page of memory this process (or anything it later forks) allocates
+gets charged against `containerdemo`'s `memory.max`, and any child process
+automatically inherits its parent's cgroup membership — you don't need to
+repeat this step for processes the container spawns later (like `nginx`,
+in step 8). Worth noting for realism: this two-step "create process, then
+move it into a cgroup" approach has a small race window where the process
+briefly runs *before* being resource-constrained. Modern container
+runtimes like `runc` close that gap using the `clone3(2)` syscall's
+`CLONE_INTO_CGROUP` flag (Linux 5.7+), which places a process into a
+target cgroup atomically as part of its creation — no window at all. We're
+using the older, two-step approach here because it's easier to observe and
+reason about by hand.
 
 ## 7. Networking: veth pair + NAT
 
@@ -554,6 +604,18 @@ echo "nameserver 8.8.8.8" > /etc/resolv.conf
 ping -c 2 10.200.1.1        # host reachable
 ```
 
+**Command-by-command — every row runs in Shell A, inside the container's
+namespace:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `ip link set lo up` | Shell A | `lo` exists (every net namespace gets one automatically) but is `DOWN` | Sets `IFF_UP` on the container's *own private* loopback — a fresh net namespace's `lo` starts down, unlike a normal machine's | `ip link show lo` → `UP` |
+| `ip addr add 10.200.1.2/24 dev veth-ctr` | Shell A | `veth-ctr` exists (moved in by Shell B in the previous block) but has no address | Assigns the address inside this namespace; also auto-creates the `10.200.1.0/24` connected route, but in the *container's own* private routing table, separate from Shell B's | `ip addr show veth-ctr` shows it |
+| `ip link set veth-ctr up` | Shell A | `veth-ctr` `DOWN` on this end | Brings this end up too — now *both* ends of the pair are administratively up, so carrier state flips to fully `UP` on both sides simultaneously | `ip link show veth-ctr` → `UP`; back in Shell B, `veth-host` also flips from `NO-CARRIER` to full `UP`/`LOWER_UP` |
+| `ip route add default via 10.200.1.1` | Shell A | Container's routing table only has the connected `10.200.1.0/24` route | Adds a `0.0.0.0/0` route via the host side of the veth link, inside the container's own private routing table | `ip route show` (inside the container) shows `default via 10.200.1.1` |
+| `echo nameserver 8.8.8.8 > /etc/resolv.conf` | Shell A | Whatever Alpine's tarball shipped for `/etc/resolv.conf` (typically empty/absent) | A plain file write — but because this is under the chroot, it's served through the overlay: since the file only existed (or didn't) in `lower/`, this write triggers copy-up into `upper/` (step 3's mechanism, in action for the first time) | Container's resolver now queries `8.8.8.8` for DNS |
+| `ping -c 2 10.200.1.1` | Shell A | — | Sends two ICMP echo requests out `veth-ctr`, exercising the entire path just built (veth pair + both ends' addressing) | Two replies confirm host↔container connectivity works |
+
 **Why this step exists:** `--net` in step 5 gave the container a network
 stack so private it's actually *disconnected* — it can't talk to anything,
 including the host it's running on. That's correct and expected (it's real
@@ -571,28 +633,6 @@ rules to make it feel like an ordinary machine with internet access.
   switch, no physical layer involved at all — it's a synchronous, in-kernel
   handoff between two network devices that happen to live in different
   namespaces.
-- **`ip link set veth-ctr netns $CPID`** reparents that `net_device` object
-  out of the host's network namespace and into the container's — the
-  interface physically *moves*, it isn't cloned or duplicated. That's why
-  `veth-ctr` disappears from `ip link` in Shell B right after this line and
-  only becomes visible inside the container in Shell A.
-- **Why nothing worked before this:** a fresh net namespace starts with
-  *zero* interfaces, not even loopback — `ip link set lo up` inside the
-  container in Shell A isn't cosmetic, loopback genuinely doesn't exist in
-  an "up" state until you explicitly bring it up, which is why so many
-  programs misbehave inside a bare netns until this is done.
-- **IP addressing** on both ends of the veth pair turns it into an ordinary
-  point-to-point link — `10.200.1.1` (host side) and `10.200.1.2` (container
-  side) can now reach each other directly, the same as any two machines on
-  the same subnet.
-- **`ip route add default via 10.200.1.1`** inside the container makes the
-  host side of the veth pair the container's gateway for *everything else*
-  — any packet not destined for `10.200.1.0/24` gets sent there first.
-- **`net.ipv4.ip_forward=1`** flips on the kernel's IP forwarding path on
-  the host/VM side, letting it route packets *between* interfaces
-  (`veth-host` and `$UPLINK`) instead of only accepting traffic addressed to
-  itself. Without this, the VM would silently drop anything arriving on
-  `veth-host` destined elsewhere.
 - **`MASQUERADE`** is a netfilter rule installed into the `nat` table's
   `POSTROUTING` hook (one of several fixed points in the kernel's packet
   processing pipeline that netfilter lets you attach rules to). As a packet
@@ -632,6 +672,15 @@ nginx
 curl 127.0.0.1               # should return the nginx welcome page
 ```
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does | After / how to check |
+|---|---|---|---|---|
+| `apk update` | Shell A | No local package index cached inside the container | Uses the container's own DNS + routing (both just built in step 7) to fetch Alpine's repo index over HTTP(S), through the veth+NAT path, into local cache | `apk` now knows what package versions are available |
+| `apk add nginx` | Shell A | `nginx` binary/config absent from the rootfs | Downloads the `.apk` package and extracts its files into the container's filesystem — every write goes through the overlay, landing in `upper/` via copy-up — then runs any post-install scripts the package ships | `/usr/sbin/nginx`, `/etc/nginx/`, etc. now exist, and are visible in `upper/` (see step 10) |
+| `nginx` | Shell A | Nothing bound to port 80 in this network namespace | Starts the nginx master process, which forks worker processes (they automatically inherit this container's PID/mount/net namespaces — no need to `unshare` again), and binds a listening socket on `0.0.0.0:80` scoped to this namespace's own socket table | `ps aux` shows nginx's master + worker processes; a listening socket exists on `:80` |
+| `curl 127.0.0.1` | Shell A | — | Connects via the container's *own* private loopback (from step 7, separate from the host's `lo`), delivered straight to nginx's listening socket | Prints nginx's welcome HTML |
+
 **Why this step exists:** everything so far has been infrastructure — a
 filesystem, isolation, a resource cap, a network path. This step runs an
 actual, real-world workload inside all of it, proving the container isn't
@@ -642,15 +691,14 @@ box.
 **Under the hood:** `apk update`/`apk add nginx` reaching Alpine's package
 mirror is the first real, end-to-end proof that step 7's plumbing works —
 it needs *both* a route out through the veth+NAT path *and* working DNS
-resolution (the `/etc/resolv.conf` written in step 7), all happening inside
-what is, from the kernel's point of view, a completely independent network
-stack with its own sockets and routing table. Once `nginx` binds to port 80
-and `curl 127.0.0.1` succeeds, note that this loopback (`127.0.0.1`) is the
-container's *own* private loopback interface from step 7 — a second nginx
-bound to port 80 on the VM's real host network namespace could coexist
-without any conflict at all, because "port 80" is scoped per-network-
-namespace, not global to the machine. This is exactly why dozens of
-containers on one Docker host can each think they own port 80.
+resolution, all happening inside what is, from the kernel's point of view,
+a completely independent network stack with its own sockets and routing
+table. Once `nginx` binds to port 80 and `curl 127.0.0.1` succeeds, note
+that this loopback is the container's *own* private loopback interface — a
+second nginx bound to port 80 on the VM's real host network namespace could
+coexist without any conflict at all, because "port 80" is scoped
+per-network-namespace, not global to the machine. This is exactly why
+dozens of containers on one Docker host can each think they own port 80.
 
 ## 9. Reach the container from the host
 
@@ -659,6 +707,12 @@ containers on one Docker host can each think they own port 80.
 ```bash
 curl 10.200.1.2
 ```
+
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `curl 10.200.1.2` | Shell B | Shell B already has a route to `10.200.1.0/24` via `veth-host` (auto-added in step 7) | The VM's routing table sends the connection out `veth-host`; the veth driver hands it straight to `veth-ctr` on the container side — no NAT/uplink involvement at all, since host and container are directly, mutually routable over the veth link; the container's own TCP/IP stack completes the handshake and delivers the connection to nginx's listening socket | Prints the same nginx welcome HTML as step 8's `curl 127.0.0.1` |
 
 If this returns the same nginx welcome HTML, the full path — namespaces,
 veth, routing, NAT/forwarding rules — is working end to end.
@@ -669,22 +723,15 @@ can reach *in* — closing the loop and confirming the whole network path is
 genuinely bidirectional, not an accident of NAT.
 
 **Under the hood:** trace the packet in the opposite direction from step 7.
-The VM's normal routing table already has a route to `10.200.1.2` via
-`veth-host` (added implicitly the moment that address was assigned in step
-7), so this request goes straight out `veth-host`; the veth driver hands it
-directly to `veth-ctr` on the other end — inside the container's netns —
-with no involvement of the uplink/NAT machinery at all. That machinery
-(MASQUERADE, FORWARD rules) is only needed for the container reaching
+That MASQUERADE/FORWARD machinery is only needed for the container reaching
 *outward* to the wider internet, where it needs a translated source
 address; here, host and container are directly, mutually routable over the
-veth link, so nothing needs to be rewritten. The container's own,
-independent TCP/IP stack then delivers the connection to nginx's listening
-socket, exactly as it would for any other client on the "network." Contrast
-this with real Docker port publishing (`-p 8080:80`): because Docker
-containers usually live behind a bridge on a private subnet the host
-doesn't automatically route to, exposing a port externally requires an
-explicit DNAT rule on the host redirecting traffic — here we skip that only
-because we gave the container a directly-routable IP by hand.
+veth link, so nothing needs to be rewritten. Contrast this with real Docker
+port publishing (`-p 8080:80`): because Docker containers usually live
+behind a bridge on a private subnet the host doesn't automatically route
+to, exposing a port externally requires an explicit DNAT rule on the host
+redirecting traffic — here we skip that only because we gave the container
+a directly-routable IP by hand.
 
 ## 10. Inspect the overlay diff
 
@@ -698,6 +745,13 @@ find /containerdemo/upper -maxdepth 3
 diff <(cd /containerdemo/lower && find . | sort) \
      <(cd /containerdemo/merged && find . | sort) | head -50
 ```
+
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does | After / how to check |
+|---|---|---|---|---|
+| `find /containerdemo/upper -maxdepth 3` | Shell B | — | Lists everything that physically exists in `upper/` — every entry is either a copy-up from `lower/` (step 3's mechanism) or a wholly new file `nginx`/`apk` created, or a whiteout marker for something deleted | Prints paths like `etc/nginx/...`, `var/log/nginx/...`, `run/nginx.pid` |
+| `diff <(...lower...) <(...merged...)` | Shell B | — | Compares a sorted listing of the pristine `lower/` tree against the union `merged/` tree (as seen through the overlay) | Shows exactly the paths that are new or changed — nginx's full on-disk footprint |
 
 This is the same mechanism a real container runtime uses to build image
 layers and compute `docker diff`-style output.
@@ -746,6 +800,18 @@ vagrant destroy -f
 
 and re-run `vagrant up` to start the lab over from scratch.
 
+**Command-by-command:**
+
+| Command | Where it runs | Before | What it does in the kernel | After / how to check |
+|---|---|---|---|---|
+| `exit` | Shell A | The chrooted `/bin/sh` (PID 1 of its own PID namespace) is running | Terminates that process. Because `--fork` made it a *child* of the original `unshare` command, control returns to that parent — your original login shell, back in the VM's normal, un-namespaced world. Since this was the last (and only) process in all five namespaces `unshare` created, their reference counts drop to zero and the kernel frees the `pid_namespace`, `uts_namespace`, `ipc_namespace`, mount namespace, and `net_namespace` objects — anything mounted only inside that private mount namespace (the container's `/proc`, `/sys`) is torn down automatically as part of that | Your terminal shows the *original* root shell prompt again (not the `/ #` one) — you're back in Shell A's un-namespaced starting point |
+| `iptables -t nat -D POSTROUTING -o "$UPLINK" -j MASQUERADE` | Shell B | Rule present (from step 7) | Removes the matching rule from the `nat` table's `POSTROUTING` chain (matched by full rule spec, not position) | `iptables -t nat -L POSTROUTING -n` no longer shows it |
+| `iptables -D FORWARD ...` ×2 | Shell B | Both `FORWARD` rules present | Removes each matching rule from the `filter` table's `FORWARD` chain | `iptables -L FORWARD -n` is empty again |
+| `ip link delete veth-host` | Shell B | `veth-host` exists (its peer `veth-ctr` lived inside the container's now-defunct netns) | Destroys the `veth-host` device; since a veth pair shares one underlying kernel object between its two ends, this also removes the peer, even though it was last seen inside a namespace that no longer exists | `ip link show` no longer lists `veth-host` |
+| `umount /containerdemo/merged` | Shell B | Overlay superblock active, `merged/` shows the union view | Releases the overlay's in-kernel superblock; `lower/` and `upper/` themselves are untouched, ordinary directories on disk | `ls /containerdemo/merged` shows an empty directory again |
+| `rmdir /sys/fs/cgroup/containerdemo` | Shell B | Cgroup is empty of processes (the container's shell already exited) | Removes the cgroup kernel object — cgroup v2 refuses this if any process is still a member | `ls /sys/fs/cgroup` no longer lists `containerdemo` |
+| `vagrant destroy -f` | **Not Shell A or B — run this on your real host machine's terminal**, outside the VM entirely, from the directory containing the `Vagrantfile` | VM is running | Powers off and deletes the entire VirtualBox VM and its virtual disk | `vagrant up` is required again for a completely fresh VM |
+
 **Why this step exists:** namespaces, cgroups, veth interfaces, and mounts
 are all live kernel state — none of it disappears automatically just
 because you're done looking at it. Skipping cleanup on a real (non-disposable)
@@ -764,13 +830,3 @@ created — but it's also worth knowing this is exactly how tools like `ip
 netns add` deliberately *keep* a namespace alive with no process running in
 it at all: by bind-mounting its `nsfs` inode to a persistent path under
 `/var/run/netns/`, holding the reference count above zero indefinitely.
-`veth-host` and `veth-ctr` are a linked pair sharing one driver-level
-object, so deleting either end automatically destroys the other — there's
-no separate cleanup step needed for the container side, even though by this
-point that side lives inside a namespace that (mostly) no longer exists.
-`rmdir` on the cgroup only succeeds because it's empty of processes — the
-container's shell already exited in the previous command, and cgroup v2
-refuses to remove a cgroup that still has member processes. `umount`
-simply releases the overlay filesystem's in-kernel superblock; `lower/` and
-`upper/` themselves are untouched, ordinary directories on disk and can be
-remounted at any time to inspect or reuse them.
