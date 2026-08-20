@@ -61,11 +61,15 @@ vagrant up
 vagrant ssh
 ```
 
+![vagrant up bringing the VM online](screenshots/step0-vagrant-up.png)
+
 Everything below runs **inside the VM**. Become root for the whole session:
 
 ```bash
 sudo -i
 ```
+
+![vagrant ssh followed by sudo -i](screenshots/step0-vagrant-ssh-sudo.png)
 
 You'll need **two root shells** into the VM from step 7 onward — one stays
 "inside" the container's namespaces, the other stays on the host to wire up
@@ -96,6 +100,8 @@ OverlayFS needs three directories plus a mountpoint:
 mkdir -p /containerdemo/{lower,upper,work,merged}
 cd /containerdemo
 ```
+
+![Creating the lower/upper/work/merged workspace](screenshots/step1-workspace-layout.png)
 
 **Command-by-command:**
 
@@ -172,6 +178,8 @@ tar -xzf alpine-minirootfs.tar.gz -C lower
 ls lower
 ```
 
+![Downloading and extracting the Alpine minirootfs into lower/](screenshots/step2-fetch-alpine.png)
+
 > If that exact version 404s, browse
 > `https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/` and swap in
 > the current filename.
@@ -215,6 +223,8 @@ mount -t overlay overlay \
 
 ls /containerdemo/merged
 ```
+
+![Mounting the overlay and inspecting merged/upper/work](screenshots/step3-mount-overlay.png)
 
 > **Which directory do you need to be in?** None in particular — every path
 > in this command (`lowerdir=`, `upperdir=`, `workdir=`, and the mountpoint
@@ -294,6 +304,8 @@ mkdir /sys/fs/cgroup/containerdemo
 echo 268435456 > /sys/fs/cgroup/containerdemo/memory.max   # 256MB cap
 cat /sys/fs/cgroup/containerdemo/memory.max
 ```
+
+![Creating the cgroup and setting memory.max](screenshots/step4-cgroup-setup.png)
 
 **Command-by-command:**
 
@@ -376,6 +388,8 @@ hostname
 ps aux                 # should show exactly one process — this shell, as PID 1
 ip link                # only shows nothing or a down 'lo' — no host interfaces visible
 ```
+
+![unshare + chroot, mounting /proc, and confirming PID/hostname/network isolation](screenshots/step5-namespaces-chroot.png)
 
 Mount `/sys` too (needed later for nginx and general sanity):
 
@@ -504,6 +518,8 @@ echo <PID> > /sys/fs/cgroup/containerdemo/cgroup.procs
 cat /sys/fs/cgroup/containerdemo/cgroup.procs
 ```
 
+![Finding the container's PID and adding it to the cgroup](screenshots/step6-attach-cgroup.png)
+
 The container process (and anything it forks) is now memory-capped.
 
 **Command-by-command:**
@@ -590,6 +606,8 @@ except the one row called out below:
 | `iptables -A FORWARD -i veth-host -o "$UPLINK" -j ACCEPT` | Shell B | `filter`/`FORWARD` chain empty | Appends a permit rule to the default (`filter`) table's `FORWARD` chain for container→internet traffic. | `iptables -L FORWARD -n` shows this rule. |
 | `iptables -A FORWARD -i "$UPLINK" -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT` | Shell B | (same chain, second rule) | Appends the return-path rule, scoped to `RELATED,ESTABLISHED` using the conntrack table the MASQUERADE rule populates — only replies to connections the *container itself* started are let back in, not arbitrary unsolicited inbound traffic. | `iptables -L FORWARD -n` shows two rules now. |
 
+![Shell B: creating the veth pair, moving veth-ctr into the container, and setting up NAT/forwarding](screenshots/step7-shellb-veth-nat.png)
+
 **Shell A** (back inside the container):
 
 ```bash
@@ -615,6 +633,8 @@ namespace:**
 | `ip route add default via 10.200.1.1` | Shell A | Container's routing table only has the connected `10.200.1.0/24` route | Adds a `0.0.0.0/0` route via the host side of the veth link, inside the container's own private routing table | `ip route show` (inside the container) shows `default via 10.200.1.1` |
 | `echo nameserver 8.8.8.8 > /etc/resolv.conf` | Shell A | Whatever Alpine's tarball shipped for `/etc/resolv.conf` (typically empty/absent) | A plain file write — but because this is under the chroot, it's served through the overlay: since the file only existed (or didn't) in `lower/`, this write triggers copy-up into `upper/` (step 3's mechanism, in action for the first time) | Container's resolver now queries `8.8.8.8` for DNS |
 | `ping -c 2 10.200.1.1` | Shell A | — | Sends two ICMP echo requests out `veth-ctr`, exercising the entire path just built (veth pair + both ends' addressing) | Two replies confirm host↔container connectivity works |
+
+![Shell A: bringing veth-ctr up, adding the default route, and a successful ping back to the host](screenshots/step7-shella-network-config.png)
 
 **Why this step exists:** `--net` in step 5 gave the container a network
 stack so private it's actually *disconnected* — it can't talk to anything,
@@ -671,6 +691,8 @@ apk add nginx curl
 nginx
 curl -i 127.0.0.1
 ```
+
+![Installing nginx + curl, starting nginx, and the 404 response](screenshots/step8-nginx-install-404.png)
 
 > **Expect a `404 Not Found`, not a welcome page — and that's correct.**
 > Unlike Debian/Ubuntu's `nginx` package, Alpine's ships a default vhost
@@ -768,6 +790,8 @@ Then, back in **Shell B**:
 curl -i 10.200.1.2
 ```
 
+![curl from Shell B now returning 200 OK with the nginx welcome page](screenshots/step9-curl-from-host-200ok.png)
+
 **Command-by-command:**
 
 | Command | Where it runs | Before | What it does | After / how to check |
@@ -804,6 +828,8 @@ find /containerdemo/upper -maxdepth 3
 diff <(cd /containerdemo/lower && find . | sort) \
      <(cd /containerdemo/merged && find . | sort) | head -50
 ```
+
+![Listing upper/ and diffing lower/ against merged/](screenshots/step10-overlay-diff.png)
 
 **Command-by-command:**
 
@@ -874,6 +900,12 @@ du -sh /containerdemo/{lower,upper,work,merged}
 ps aux | grep -E 'nginx|chroot'
 ```
 
+![Shell B: comparing namespace inodes for self vs the container's PID](screenshots/step11-namespace-inodes.png)
+
+![Shell B: checking the cgroup's memory.max and cgroup.procs](screenshots/step11-cgroup-check.png)
+
+![Shell B: full network/mount/directory/process audit](screenshots/step11-shellb-audit.png)
+
 > **What the two `readlink` lines mean, explicitly:**
 >
 > ```text
@@ -919,6 +951,8 @@ ip route
 cat /etc/resolv.conf
 cat /proc/mounts | grep -E 'proc|sysfs|overlay'
 ```
+
+![Shell A: hostname, ps aux, interfaces, routes, resolv.conf, and /proc/mounts from inside the container](screenshots/step11-shella-audit.png)
 
 **What you should see, and why it's proof the isolation is real:**
 
