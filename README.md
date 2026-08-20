@@ -667,19 +667,34 @@ instead of letting a daemon script it for us.
 
 ```bash
 apk update
-apk add nginx
+apk add nginx curl
 nginx
-curl 127.0.0.1               # should return the nginx welcome page
+curl -i 127.0.0.1
 ```
+
+> **Expect a `404 Not Found`, not a welcome page — and that's correct.**
+> Unlike Debian/Ubuntu's `nginx` package, Alpine's ships a default vhost
+> that deliberately returns `404` for *every* path:
+> `/etc/nginx/http.d/default.conf` contains `location / { return 404; }`,
+> with the comment "This is a default site configuration which will simply
+> return 404, preventing chance access to any other virtualhost" — a
+> security default against Host-header/vhost hijacking, not a missing file
+> (there's a perfectly good `index.html` sitting unused at
+> `/var/lib/nginx/html/index.html`). A `404` response here is actually
+> *better* proof the stack works than a static welcome page would be: it
+> means the request crossed the container's private loopback, reached
+> nginx's listening socket, and nginx's own server-block logic executed and
+> returned a deliberate answer — real application behavior, not just a
+> file read.
 
 **Command-by-command:**
 
 | Command | Where it runs | Before | What it does | After / how to check |
 |---|---|---|---|---|
 | `apk update` | Shell A | No local package index cached inside the container | Uses the container's own DNS + routing (both just built in step 7) to fetch Alpine's repo index over HTTP(S), through the veth+NAT path, into local cache | `apk` now knows what package versions are available |
-| `apk add nginx` | Shell A | `nginx` binary/config absent from the rootfs | Downloads the `.apk` package and extracts its files into the container's filesystem — every write goes through the overlay, landing in `upper/` via copy-up — then runs any post-install scripts the package ships | `/usr/sbin/nginx`, `/etc/nginx/`, etc. now exist, and are visible in `upper/` (see step 10) |
+| `apk add nginx curl` | Shell A | `nginx` binary/config absent from the rootfs; `curl` isn't in the Alpine minirootfs either — only BusyBox's built-in applets (`wget`, etc.) ship by default, unlike the VM host, which has real `curl` | Downloads both `.apk` packages and extracts their files into the container's filesystem — every write goes through the overlay, landing in `upper/` via copy-up — then runs any post-install scripts each package ships | `/usr/sbin/nginx`, `/etc/nginx/`, `/usr/bin/curl`, etc. now exist, and are visible in `upper/` (see step 10) |
 | `nginx` | Shell A | Nothing bound to port 80 in this network namespace | Starts the nginx master process, which forks worker processes (they automatically inherit this container's PID/mount/net namespaces — no need to `unshare` again), and binds a listening socket on `0.0.0.0:80` scoped to this namespace's own socket table | `ps aux` shows nginx's master + worker processes; a listening socket exists on `:80` |
-| `curl 127.0.0.1` | Shell A | — | Connects via the container's *own* private loopback (from step 7, separate from the host's `lo`), delivered straight to nginx's listening socket | Prints nginx's welcome HTML |
+| `curl -i 127.0.0.1` | Shell A | — | Connects via the container's *own* private loopback (from step 7, separate from the host's `lo`), delivered straight to nginx's listening socket; nginx's default server block matches the request and executes its configured `return 404` | Prints `HTTP/1.1 404 Not Found` plus an HTML body with `nginx` in the footer — this is a real response *from* nginx, not a connection failure |
 
 **Why this step exists:** everything so far has been infrastructure — a
 filesystem, isolation, a resource cap, a network path. This step runs an
@@ -688,34 +703,37 @@ just isolated in theory but is a genuinely usable environment: it can
 install software over the network and serve traffic like any ordinary Linux
 box.
 
-**Under the hood:** `apk update`/`apk add nginx` reaching Alpine's package
-mirror is the first real, end-to-end proof that step 7's plumbing works —
-it needs *both* a route out through the veth+NAT path *and* working DNS
-resolution, all happening inside what is, from the kernel's point of view,
-a completely independent network stack with its own sockets and routing
-table. Once `nginx` binds to port 80 and `curl 127.0.0.1` succeeds, note
-that this loopback is the container's *own* private loopback interface — a
-second nginx bound to port 80 on the VM's real host network namespace could
-coexist without any conflict at all, because "port 80" is scoped
-per-network-namespace, not global to the machine. This is exactly why
-dozens of containers on one Docker host can each think they own port 80.
+**Under the hood:** `apk update`/`apk add nginx curl` reaching Alpine's
+package mirror is the first real, end-to-end proof that step 7's plumbing
+works — it needs *both* a route out through the veth+NAT path *and* working
+DNS resolution, all happening inside what is, from the kernel's point of
+view, a completely independent network stack with its own sockets and
+routing table. Once `nginx` binds to port 80 and `curl -i 127.0.0.1`
+returns an HTTP response (404 or otherwise), note that this loopback is the
+container's *own* private loopback interface — a second nginx bound to
+port 80 on the VM's real host network namespace could coexist without any
+conflict at all, because "port 80" is scoped per-network-namespace, not
+global to the machine. This is exactly why dozens of containers on one
+Docker host can each think they own port 80.
 
 ## 9. Reach the container from the host
 
 **Shell B.**
 
 ```bash
-curl 10.200.1.2
+curl -i 10.200.1.2
 ```
 
 **Command-by-command:**
 
 | Command | Where it runs | Before | What it does in the kernel | After / how to check |
 |---|---|---|---|---|
-| `curl 10.200.1.2` | Shell B | Shell B already has a route to `10.200.1.0/24` via `veth-host` (auto-added in step 7) | The VM's routing table sends the connection out `veth-host`; the veth driver hands it straight to `veth-ctr` on the container side — no NAT/uplink involvement at all, since host and container are directly, mutually routable over the veth link; the container's own TCP/IP stack completes the handshake and delivers the connection to nginx's listening socket | Prints the same nginx welcome HTML as step 8's `curl 127.0.0.1` |
+| `curl -i 10.200.1.2` | Shell B (the VM host already has `curl` — it was installed by the `Vagrantfile`'s provisioner, unlike the Alpine container in step 8) | Shell B already has a route to `10.200.1.0/24` via `veth-host` (auto-added in step 7) | The VM's routing table sends the connection out `veth-host`; the veth driver hands it straight to `veth-ctr` on the container side — no NAT/uplink involvement at all, since host and container are directly, mutually routable over the veth link; the container's own TCP/IP stack completes the handshake and delivers the connection to nginx's listening socket | Prints the exact same `HTTP/1.1 404 Not Found` response as step 8's `curl -i 127.0.0.1` — same nginx process, same default vhost logic, just reached over the veth link instead of the container's own loopback |
 
-If this returns the same nginx welcome HTML, the full path — namespaces,
-veth, routing, NAT/forwarding rules — is working end to end.
+If this returns the same `404` response as step 8, the full path —
+namespaces, veth, routing, NAT/forwarding rules — is working end to end.
+(A matching `404` is the success condition here, not a failure — see the
+callout in step 8 for why Alpine's `nginx` responds this way by default.)
 
 **Why this step exists:** step 8 proved the container can reach *out*. This
 step proves the reverse direction — that something *outside* the container
