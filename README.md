@@ -843,7 +843,9 @@ cleanup, to confirm it actually all went away).
 
 ```bash
 # Namespaces: prove the container's process really is in different
-# namespaces than this shell, by comparing inode numbers
+# namespaces than this shell, by comparing inode numbers.
+# /proc/self/... is THIS shell, i.e. the HOST MACHINE's own namespaces.
+# /proc/$CPID/... is the CONTAINER's namespaces, as seen from outside.
 CPID=<PID>          # from step 6/7, if you don't still have it
 readlink /proc/self/ns/{pid,uts,ipc,mnt,net}
 readlink /proc/$CPID/ns/{pid,uts,ipc,mnt,net}
@@ -871,6 +873,39 @@ du -sh /containerdemo/{lower,upper,work,merged}
 # (PID namespaces nest), just under their real, host-assigned PIDs
 ps aux | grep -E 'nginx|chroot'
 ```
+
+> **What the two `readlink` lines mean, explicitly:**
+>
+> ```text
+> $ readlink /proc/self/ns/{pid,uts,ipc,mnt,net}     # ← HOST MACHINE (Shell B itself)
+> pid:[4026531836]
+> uts:[4026531837]
+> ipc:[4026531838]
+> mnt:[4026531840]
+> net:[4026531841]
+>
+> $ readlink /proc/$CPID/ns/{pid,uts,ipc,mnt,net}    # ← CONTAINER (Shell A's process)
+> pid:[4026532792]
+> uts:[4026532793]
+> ipc:[4026532794]
+> mnt:[4026532796]
+> net:[4026532797]
+> ```
+>
+> (Your actual numbers will differ — these are just an example — but the
+> pattern is what matters.) The **first block is the host machine's own
+> five namespaces** — the ones Shell B itself has always been running in,
+> completely ordinary and shared with the rest of the VM. The **second
+> block is the container's five namespaces** — the private ones step 5's
+> `unshare` created. Every single one of the five numbers is different
+> between the two blocks, and that's the actual, kernel-level proof of
+> isolation: `pid:[N]` isn't a label, it's the real inode number of that
+> namespace object on the `nsfs` pseudo-filesystem, so two different
+> numbers means two genuinely different kernel objects — not two processes
+> that merely *look* separate. If you ran this same `readlink
+> /proc/self/ns/...` from *inside* Shell A instead, you'd get the exact
+> same five numbers as the "container" block above, since at that point
+> `self` *is* the container's process.
 
 **Shell A (inside the container) — the same system, from the container's
 own private point of view:**
