@@ -517,6 +517,58 @@ iptables -A FORWARD -i "$UPLINK" -o veth-host -m state --state RELATED,ESTABLISH
 > (VirtualBox's NAT adapter, `10.0.2.x`). The `private_network` adapter shows
 > up separately as `enp0s8` (`192.168.56.x`) and isn't the internet uplink.
 
+**Baseline, before running the block above** — worth checking these in Shell
+B first so you can see the "before" state for yourself: `ip link show` only
+lists the VM's real interfaces (`lo`, `enp0s3`, `enp0s8` — no `veth-*` yet);
+`ip route show` has no route to `10.200.1.0/24`; `cat
+/proc/sys/net/ipv4/ip_forward` reads `0`; `iptables -t nat -L POSTROUTING`
+and `iptables -L FORWARD` are both empty. In Shell A, `ip link show` shows
+only a `DOWN` loopback — nothing else exists.
+
+**Command-by-command — every line runs in Shell B (the host/VM's own
+network namespace), not inside the container, unless noted:**
+
+- **`ip link add veth-host type veth peer name veth-ctr`** — the kernel's
+  veth driver allocates *two* linked devices in one atomic call; they're a
+  permanently paired unit from creation, not two devices connected later.
+  Both currently sit in Shell B's namespace, both `DOWN`, neither has an IP.
+  Check: `ip link show` in Shell B now lists both.
+- **`ip link set veth-ctr netns $CPID`** — issued from Shell B, but it's
+  the one line in this block that *acts on the container's namespace*: the
+  kernel looks up the netns owned by PID `$CPID` (via `/proc/$CPID/ns/net`)
+  and reparents `veth-ctr` into it — a real move, not a copy. Check: run
+  `ip link show` in Shell B again — `veth-ctr` is now **gone** from this
+  namespace entirely; it only exists inside the container from here on
+  (visible from Shell A, or via `nsenter -t $CPID -n ip link` from Shell B).
+  `veth-host` stays behind, untouched.
+- **`ip addr add 10.200.1.1/24 dev veth-host`** — assigns the address; as a
+  side effect the kernel auto-inserts a connected route,
+  `10.200.1.0/24 dev veth-host ... src 10.200.1.1` — you never typed this
+  route, every IP assignment implicitly creates one for its subnet. Check:
+  `ip route show` now has that entry.
+- **`ip link set veth-host up`** — sets the `IFF_UP` flag on this end only.
+  A veth pair only reports full "carrier up" once *both* ends are
+  administratively up, so this may still show `NO-CARRIER`/
+  `LOWER_LAYERDOWN` until Shell A brings `veth-ctr` up in the next block.
+- **`sysctl -w net.ipv4.ip_forward=1`** — writes `1` to
+  `/proc/sys/net/ipv4/ip_forward`. This sysctl is itself per-network-
+  namespace — it only enables forwarding inside Shell B's (the VM's)
+  namespace; the container has its own independent copy, irrelevant here
+  since the container never routes traffic for anyone else. Check: `cat
+  /proc/sys/net/ipv4/ip_forward` now reads `1`.
+- **`iptables -t nat -A POSTROUTING -o "$UPLINK" -j MASQUERADE`** — appends
+  a rule to netfilter's `nat` table at the `POSTROUTING` hook. It doesn't
+  touch existing traffic — it's a standing rule that only fires on future
+  packets leaving via `$UPLINK`. Check: `iptables -t nat -L POSTROUTING -n`.
+- **`iptables -A FORWARD -i veth-host -o "$UPLINK" -j ACCEPT`** — appends a
+  permit rule to the (default, `filter`) table's `FORWARD` chain for
+  container→internet traffic. Check: `iptables -L FORWARD -n`.
+- **`iptables -A FORWARD -i "$UPLINK" -o veth-host -m state --state
+  RELATED,ESTABLISHED -j ACCEPT`** — the return-path rule, scoped to
+  `RELATED,ESTABLISHED` using the conntrack table the MASQUERADE rule
+  populates, so only replies to connections the *container itself* started
+  are let back in — not arbitrary unsolicited inbound traffic.
+
 **Shell A** (back inside the container):
 
 ```bash
